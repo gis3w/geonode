@@ -299,7 +299,7 @@ def fixup_style(cat, resource, style):
     for lyr in layers:
         if lyr.default_style.name in _style_templates:
             logger.info("%s uses a default style, generating a new one", lyr)
-            name = _style_name(resource)
+            name = _style_name(lyr)
             if style is None:
                 sld = get_sld_for(cat, lyr)
             else:
@@ -1564,7 +1564,7 @@ def style_update(request, url):
     request.body, which is in this format:
     """
     affected_layers = []
-    if request.method in ('POST', 'PUT'):  # we need to parse xml
+    if request.method in ('POST', 'PUT', 'DELETE'):  # we need to parse xml
         # Need to remove NSx from IE11
         if "HTTP_USER_AGENT" in request.META:
             if ('Trident/7.0' in request.META['HTTP_USER_AGENT'] and
@@ -1572,36 +1572,69 @@ def style_update(request, url):
                 txml = re.sub(r'xmlns:NS[0-9]=""', '', request.body)
                 txml = re.sub(r'NS[0-9]:', '', txml)
                 request._body = txml
-        tree = ET.ElementTree(ET.fromstring(request.body))
-        elm_namedlayer_name = tree.findall(
-            './/{http://www.opengis.net/sld}Name')[0]
-        elm_user_style_name = tree.findall(
-            './/{http://www.opengis.net/sld}Name')[1]
-        elm_user_style_title = tree.find(
-            './/{http://www.opengis.net/sld}Title')
-        if not elm_user_style_title:
-            elm_user_style_title = elm_user_style_name
-        layer_name = elm_namedlayer_name.text
-        style_name = elm_user_style_name.text
-        sld_body = '<?xml version="1.0" encoding="UTF-8"?>%s' % request.body
+        style_name = os.path.basename(request.path)
+        elm_user_style_title = style_name
+        sld_body = None
+        layer_name = None
+        if 'name' in request.GET:
+            style_name = request.GET['name']
+            sld_body = request.body
+        elif request.method == 'DELETE':
+            style_name = os.path.basename(request.path)
+        else:
+            try:
+                tree = ET.ElementTree(ET.fromstring(request.body))
+                elm_namedlayer_name = tree.findall(
+                    './/{http://www.opengis.net/sld}Name')[0]
+                elm_user_style_name = tree.findall(
+                    './/{http://www.opengis.net/sld}Name')[1]
+                elm_user_style_title = tree.find(
+                    './/{http://www.opengis.net/sld}Title')
+                if not elm_user_style_title:
+                    elm_user_style_title = elm_user_style_name.text
+                layer_name = elm_namedlayer_name.text
+                style_name = elm_user_style_name.text
+                sld_body = '<?xml version="1.0" encoding="UTF-8"?>%s' % request.body
+            except BaseException:
+                logger.warn("Could not recognize Style and Layer name from Request!")
         # add style in GN and associate it to layer
+        if request.method == 'DELETE':
+            if style_name:
+                try:
+                    style = Style.objects.get(name=style_name)
+                    style.delete()
+                except BaseException:
+                    pass
         if request.method == 'POST':
-            style = Style(name=style_name, sld_body=sld_body, sld_url=url)
-            style.save()
-            layer = Layer.objects.get(alternate=layer_name)
-            style.layer_styles.add(layer)
-            style.save()
-            affected_layers.append(layer)
-        elif request.method == 'PUT':  # update style in GN
-            style = Style.objects.get(name=style_name)
-            style.sld_body = sld_body
-            style.sld_url = url
-            if len(elm_user_style_title.text) > 0:
-                style.sld_title = elm_user_style_title.text
-            style.save()
-            for layer in style.layer_styles.all():
-                layer.save()
+            if style_name:
+                style, created = Style.objects.get_or_create(name=style_name)
+                style.sld_body = sld_body
+                style.sld_url = url
+                style.save()
+            layer = None
+            if layer_name:
+                try:
+                    layer = Layer.objects.get(name=layer_name)
+                except BaseException:
+                    try:
+                        layer = Layer.objects.get(alternate=layer_name)
+                    except BaseException:
+                        pass
+            if layer:
+                style.layer_styles.add(layer)
+                style.save()
                 affected_layers.append(layer)
+        elif request.method == 'PUT':  # update style in GN
+            if style_name:
+                style, created = Style.objects.get_or_create(name=style_name)
+                style.sld_body = sld_body
+                style.sld_url = url
+                if elm_user_style_title and len(elm_user_style_title) > 0:
+                    style.sld_title = elm_user_style_title
+                style.save()
+                for layer in style.layer_styles.all():
+                    layer.save()
+                    affected_layers.append(layer)
 
         # Invalidate GeoWebCache so it doesn't retain old style in tiles
         try:
@@ -1863,33 +1896,63 @@ def _prepare_thumbnail_body_from_opts(request_body, request=None):
         bbox_to_projection([float(coord) for coord in request_body['bbox']] + [request_body['srid'], ],
                            target_srid=4326)[:4])
 
+    # Fetch XYZ tiles - we are assuming Mercatore here
+    bounds = wgs84_bbox[0:4]
+    # Fixes bounds to tiles system
+    bounds[0] = _v(bounds[0], x=True, target_srid=4326)
+    bounds[2] = _v(bounds[2], x=True, target_srid=4326)
+    if bounds[3] > 85.051:
+        bounds[3] = 85.0
+    if bounds[1] < -85.051:
+        bounds[1] = -85.0
+    if 'zoom' in request_body:
+        zoom = request_body['zoom']
+    else:
+        zoom = bounds_to_zoom_level(bounds, width, height)
+
+    t_ll = mercantile.tile(bounds[0], bounds[1], zoom)
+    t_ur = mercantile.tile(bounds[2], bounds[3], zoom)
+
+    numberOfRows = t_ll.y - t_ur.y + 1
+
+    bounds_ll = mercantile.bounds(t_ll)
+    bounds_ur = mercantile.bounds(t_ur)
+
+    lat_res = abs(256 / (bounds_ur.north - bounds_ur.south))
+    lng_res = abs(256 / (bounds_ll.east - bounds_ll.west))
+    top = round(abs(bounds_ur.north - bounds[3]) * -lat_res)
+    left = round(abs(bounds_ll.west - bounds[0]) * -lng_res)
+
+    tmp_tile = mercantile.tile(bounds[0], bounds[3], zoom)
+    width_acc = 256 + left
+    first_row = [tmp_tile]
+    # Add tiles to fill image width
+    while width > width_acc:
+        c = mercantile.ul(tmp_tile.x + 1, tmp_tile.y, zoom)
+        lng = _v(c.lng, x=True, target_srid=4326)
+        if lng == 180.0:
+            lng = -180.0
+        tmp_tile = mercantile.tile(lng, bounds[3], zoom)
+        first_row.append(tmp_tile)
+        width_acc = width_acc + 256
+
     # Build Image Request Template
     _img_request_template = "<div style='height:{height}px; width:{width}px;'>\
-        <div style='position: absolute; z-index: 749; \
+        <div style='position: absolute; top:{top}px; left:{left}px; z-index: 749; \
         transform: translate3d(0px, 0px, 0px) scale3d(1, 1, 1);'> \
-        \n".format(height=height, width=width)
+        \n".format(height=height, width=width, top=top, left=left)
 
-    # Fetch XYZ tiles
-    bounds = wgs84_bbox[0:4]
-    zoom = bounds_to_zoom_level(bounds, width, height)
-
-    t_ll = mercantile.tile(_v(bounds[0], x=True), _v(bounds[1], x=False), zoom)
-    t_ur = mercantile.tile(_v(bounds[2], x=True), _v(bounds[3], x=False), zoom)
-    ratio = float(max(width, height)) / float(min(width, height))
-    y_offset = 1 if ratio >= 1.5 else 0
-    xmin, ymax = t_ll.x, t_ll.y+y_offset
-    xmax, ymin = t_ur.x, t_ur.y+y_offset
-
-    for xtile in range(xmin, xmax+1):
-        for ytile in range(ymin, ymax+1):
-            box = [(xtile-xmin)*256, (ytile-ymin)*255]
+    for row in range(0, numberOfRows):
+        for col in range(0, len(first_row)):
+            box = [col * 256, row * 256]
+            t = first_row[col]
+            y = t.y + row
             if smurl:
-                imgurl = smurl.format(z=zoom, x=xtile, y=ytile)
+                imgurl = smurl.format(z=t.z, x=t.x, y=y)
                 _img_request_template += _img_src_template.format(ogc_location=imgurl,
                                                                   height=256, width=256,
                                                                   left=box[0], top=box[1])
-
-            xy_bounds = mercantile.xy_bounds(mercantile.Tile(xtile, ytile, zoom))
+            xy_bounds = mercantile.xy_bounds(t.x, y, t.z)
             params = {
                 'width': 256,
                 'height': 256,
@@ -1969,6 +2032,6 @@ def set_time_dimension(cat, name, workspace, time_presentation, time_presentatio
 
 # main entry point to create a thumbnail - will use implementation
 # defined in settings.THUMBNAIL_GENERATOR (see settings.py)
-def create_gs_thumbnail(instance, overwrite=False):
+def create_gs_thumbnail(instance, overwrite=False, check_bbox=False):
     implementation = import_string(settings.THUMBNAIL_GENERATOR)
-    return implementation(instance, overwrite)
+    return implementation(instance, overwrite, check_bbox)

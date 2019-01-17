@@ -108,10 +108,11 @@ def _resolve_map(request, id, permission='base.change_resourcebase',
     '''
     Resolve the Map by the provided typename and check the optional permission.
     '''
-    if id.isdigit():
-        key = 'pk'
-    else:
+    if Map.objects.filter(urlsuffix=id).count() > 0:
         key = 'urlsuffix'
+    else:
+        key = 'pk'
+
     return resolve_object(request, Map, {key: id}, permission=permission,
                           permission_msg=msg, **kwargs)
 
@@ -911,9 +912,13 @@ def add_layers_to_map_config(
                 wms_capabilities = wms_capabilities_resp.getvalue()
                 if wms_capabilities:
                     import xml.etree.ElementTree as ET
+                    namespaces = {'wms': 'http://www.opengis.net/wms',
+                                  'xlink': 'http://www.w3.org/1999/xlink',
+                                  'xsi': 'http://www.w3.org/2001/XMLSchema-instance'}
+
                     e = ET.fromstring(wms_capabilities)
                     for atype in e.findall(
-                            "./[Name='%s']/Extent[@name='time']" % (layername)):
+                            "./[wms:Name='%s']/wms:Dimension[@name='time']" % (layer.alternate), namespaces):
                         dim_name = atype.get('name')
                         if dim_name:
                             dim_name = str(dim_name).lower()

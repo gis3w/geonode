@@ -114,7 +114,7 @@ def get_visible_resources(queryset,
                     Q(is_published=False) & ~(
                         Q(owner__username__iexact=str(user)) | Q(group__in=group_list_all)))
             else:
-                filter_set = filter_set.exclude(is_published=False)
+                filter_set = filter_set.exclude(Q(is_published=False))
 
     if private_groups_not_visibile:
         if not is_admin:
@@ -125,6 +125,15 @@ def get_visible_resources(queryset,
                         Q(owner__username__iexact=str(user)) | Q(group__in=group_list_all)))
             else:
                 filter_set = filter_set.exclude(group__in=private_groups)
+
+    # Hide Dirty State Resources
+    if not is_admin:
+        if user:
+            filter_set = filter_set.exclude(
+                Q(dirty_state=True) & ~(
+                    Q(owner__username__iexact=str(user)) | Q(group__in=group_list_all)))
+        else:
+            filter_set = filter_set.exclude(Q(dirty_state=True))
 
     return filter_set
 
@@ -257,7 +266,7 @@ def purge_geofence_all():
                                 raise e
                 except Exception:
                     logger.debug("Response [{}] : {}".format(r.status_code, r.text))
-        except Exception:
+        except BaseException:
             tb = traceback.format_exc()
             logger.debug(tb)
 
@@ -321,9 +330,12 @@ def set_geofence_invalidate_cache():
 
             if (r.status_code < 200 or r.status_code > 201):
                 logger.warning("Could not Invalidate GeoFence Rules.")
-        except Exception:
+                return False
+            return True
+        except BaseException:
             tb = traceback.format_exc()
             logger.debug(tb)
+            return False
 
 
 @on_ogc_backend(geoserver.BACKEND_PACKAGE)
@@ -348,7 +360,7 @@ def set_geowebcache_invalidate_cache(layer_alternate):
                           auth=HTTPBasicAuth(user, passwd))
         if (r.status_code < 200 or r.status_code > 201):
             logger.warning("Could not Truncate GWC Cache for Layer '%s'." % layer_alternate)
-    except Exception:
+    except BaseException:
         tb = traceback.format_exc()
         logger.debug(tb)
 
@@ -404,11 +416,14 @@ def set_geofence_all(instance):
                 "Response {!r} : {}".format(response.status_code, response.text))
             raise RuntimeError("Could not ADD GeoServer ANONYMOUS Rule "
                                "for Layer {}".format(resource.layer.name))
-    except Exception:
+    except BaseException:
         tb = traceback.format_exc()
         logger.debug(tb)
     finally:
-        set_geofence_invalidate_cache()
+        if not settings.DELAYED_SECURITY_SIGNALS:
+            set_geofence_invalidate_cache()
+        else:
+            resource.set_dirty_state()
 
 
 @on_ogc_backend(geoserver.BACKEND_PACKAGE)
@@ -418,14 +433,15 @@ def sync_geofence_with_guardian(layer, perms, user=None, group=None):
     """
     # Create new rule-set
     gf_services = {}
-    gf_services["*"] = 'view_resourcebase' in perms or 'change_layer_style' in perms
+    gf_services["*"] = 'download_resourcebase' in perms and \
+        ('view_resourcebase' in perms or 'change_layer_style' in perms)
     gf_services["WMS"] = 'view_resourcebase' in perms or 'change_layer_style' in perms
     gf_services["GWC"] = 'view_resourcebase' in perms or 'change_layer_style' in perms
     gf_services["WFS"] = ('download_resourcebase' in perms or 'change_layer_data' in perms) \
         and layer.is_vector()
     gf_services["WCS"] = ('download_resourcebase' in perms or 'change_layer_data' in perms) \
         and not layer.is_vector()
-    gf_services["WPS"] = 'download_resourcebase' or 'change_layer_data' in perms
+    gf_services["WPS"] = 'download_resourcebase' in perms or 'change_layer_data' in perms
 
     _user = None
     if user:
@@ -445,7 +461,10 @@ def sync_geofence_with_guardian(layer, perms, user=None, group=None):
             if _group:
                 logger.debug("Adding 'group' to geofence the rule: %s %s %s" % (layer, service, _group))
                 _update_geofence_rule(layer.name, layer.workspace, service, group=_group)
-    set_geofence_invalidate_cache()
+    if not settings.DELAYED_SECURITY_SIGNALS:
+        set_geofence_invalidate_cache()
+    else:
+        layer.set_dirty_state()
 
 
 def set_owner_permissions(resource):
@@ -483,11 +502,14 @@ def remove_object_permissions(instance):
                 purge_geofence_layer_rules(resource)
         except (ObjectDoesNotExist, RuntimeError):
             pass  # This layer is not manageable by geofence
-        except Exception:
+        except BaseException:
             tb = traceback.format_exc()
             logger.debug(tb)
         finally:
-            set_geofence_invalidate_cache()
+            if not settings.DELAYED_SECURITY_SIGNALS:
+                set_geofence_invalidate_cache()
+            else:
+                resource.set_dirty_state()
 
     UserObjectPermission.objects.filter(content_type=ContentType.objects.get_for_model(resource),
                                         object_pk=instance.id).delete()
